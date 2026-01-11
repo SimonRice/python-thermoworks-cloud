@@ -197,6 +197,58 @@ class _TokenManager:
             except ClientResponseError as e:
                 raise RuntimeError("Unable to authenticate") from e
 
+    async def login_with_oauth(self, id_token: str, provider_id: str) -> None:
+        """Exchange OAuth ID token for Firebase credentials.
+
+        Args:
+            id_token: The ID token from the OAuth provider (Google, Apple, etc.)
+            provider_id: The provider identifier (e.g., "google.com", "apple.com")
+        """
+
+        url = f"{self._IDENTITY_HOST}/v1/accounts:signInWithIdp"
+        query = {"key": self._api_key}
+        headers = {
+            "Content-Type": "application/json",
+            "referer": "https://cloud.thermoworks.com/"
+        }
+        json = {
+            "postBody": f"id_token={id_token}&providerId={provider_id}",
+            "requestUri": "http://localhost",
+            "returnSecureToken": True,
+        }
+
+        response = await self._websession.request(
+            "post", url, headers=headers, json=json, params=query
+        )
+
+        if response.ok:
+            login_response = await response.json()
+            cast(_UserLoginResponse, login_response)
+            self._user_credentials = _UserCredentials.from_user_login_response(
+                login_response
+            )
+        elif response.status == 400:
+            login_response = await response.json()
+            if login_response["error"]:
+                error_response = cast(ErrorResponse, login_response["error"])
+                error_message = error_response["message"]
+                error_details = error_response["errors"]
+
+                try:
+                    error_reason = AuthenticationErrorReason(error_message)
+                except ValueError:
+                    error_reason = AuthenticationErrorReason.UNKNOWN
+                raise AuthenticationError(
+                    message=f"Authentication failed: {error_message}",
+                    reason=error_reason,
+                    details=error_details,
+                )
+        else:
+            try:
+                response.raise_for_status()
+            except ClientResponseError as e:
+                raise RuntimeError("Unable to authenticate with OAuth provider") from e
+
     @property
     def user_id(self) -> str:
         """Return id of the user that the manager is authenticate with."""
@@ -318,6 +370,30 @@ class AuthFactory:  # pylint: disable=too-few-public-methods
 
         token_manager = _TokenManager(self._websession, self._API_KEY)
         await token_manager.login(email, password)
+        return _Auth(
+            self._websession,
+            api_url_root=url_root,
+            api_key=self._API_KEY,
+            token_manager=token_manager,
+        )
+
+    async def build_auth_with_oauth(self, id_token: str, provider_id: str) -> Auth:
+        """Build an Auth instance using OAuth provider credentials.
+
+        Args:
+            id_token (str): The ID token from the OAuth provider.
+            provider_id (str): The provider identifier (e.g., "google.com", "apple.com").
+
+        Returns:
+            Auth: An Auth object for making requests on behalf of the authenticated user.
+        """
+
+        web_config = await self._get_config()
+        project_id = web_config["projectId"]
+        url_root = f"{self._FIRESTORE_HOST}/v1/projects/{project_id}/databases/(default)"
+
+        token_manager = _TokenManager(self._websession, self._API_KEY)
+        await token_manager.login_with_oauth(id_token, provider_id)
         return _Auth(
             self._websession,
             api_url_root=url_root,
